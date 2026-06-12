@@ -1,0 +1,12 @@
+sqlalchemy
+pandas
+requests
+beautifulsoup4
+lxml
+python-dateutil
+jsonschema
+psycopg2-binary
+openpyxl
+aiohttp
+nest_asyncio
+tqdm

@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  app:
+    build: .
+    container_name: firefox_cve_app
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - db
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: cvedb
+      DB_USER: cveuser
+      DB_PASSWORD: cvepass
+
+  db:
+    image: postgres:16
+    container_name: firefox_cve_db
+    environment:
+      POSTGRES_DB: cvedb
+      POSTGRES_USER: cveuser
+      POSTGRES_PASSWORD: cvepass
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - cve_pgdata:/var/lib/postgresql/data
+
+volumes:
+  cve_pgdata:

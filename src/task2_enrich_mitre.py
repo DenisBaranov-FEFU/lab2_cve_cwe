@@ -10,6 +10,7 @@ from typing import Dict, List, Any
 INPUT_FILE = "data/result_task_1.json"
 OUTPUT_FILE = "data/result_task_2.json"
 PROGRESS_FILE = "data/progress_task_2.json"
+
 TIMEOUT_SEC = 15
 MAX_CONCURRENT = 15
 BATCH_SIZE = 50
@@ -21,7 +22,6 @@ def recursive_search(data: Any, target_keys: List[str], results: List[Any] = Non
     """Рекурсивно ищет все значения по ключам в любом месте JSON."""
     if results is None:
         results = []
-    
     if isinstance(data, dict):
         for key, value in data.items():
             if key in target_keys:
@@ -30,14 +30,12 @@ def recursive_search(data: Any, target_keys: List[str], results: List[Any] = Non
     elif isinstance(data, list):
         for item in data:
             recursive_search(item, target_keys, results)
-    
     return results
 
 def find_cwe_objects(data: Any, results: List[dict] = None) -> List[dict]:
     """Рекурсивно ищет объекты-словари, содержащие ключ cweId."""
     if results is None:
         results = []
-    
     if isinstance(data, dict):
         if "cweId" in data:
             results.append(data)
@@ -46,13 +44,12 @@ def find_cwe_objects(data: Any, results: List[dict] = None) -> List[dict]:
     elif isinstance(data, list):
         for item in data:
             find_cwe_objects(item, results)
-    
     return results
 
 class CVEProcessor:
     def __init__(self):
         self.processed_ids = self._load_progress()
-        
+
     def _load_progress(self) -> set:
         if Path(PROGRESS_FILE).exists():
             try:
@@ -61,7 +58,7 @@ class CVEProcessor:
             except Exception:
                 pass
         return set()
-    
+
     def _save_progress(self):
         Path(PROGRESS_FILE).parent.mkdir(parents=True, exist_ok=True)
         with open(PROGRESS_FILE, 'w') as f:
@@ -70,46 +67,77 @@ class CVEProcessor:
     def extract_cvss_universal(self, mitre_data: dict) -> List[dict]:
         """Универсальный поиск CVSS в любом месте JSON."""
         cvss_list = []
-        
         for version_key in ["cvssV3_1", "cvssV3_0", "cvssV2_0"]:
             cvss_data_list = recursive_search(mitre_data, [version_key])
-            
             for cvss_data in cvss_data_list:
                 if isinstance(cvss_data, dict):
-                    severity = cvss_data.get("baseSeverity", "")
+                    severity = cvss_data.get("baseSeverity", " ")
                     cvss_list.append({
                         "version": version_key.lower(),
                         "score": cvss_data.get("baseScore"),
-                        "vector": cvss_data.get("vectorString", ""),
+                        "vector": cvss_data.get("vectorString", " "),
                         "severity": str(severity).lower() if severity else "unknown"
                     })
-        
         return cvss_list
-    
-    def extract_cwe_data(self, mitre_data: dict) -> dict:
-        """Извлекает данные CWE непосредственно из JSON API Mitre."""
+
+    async def extract_cwe_data(self, mitre_data: dict, session: aiohttp.ClientSession) -> dict:
+        """Извлекает данные CWE через cwe-api.mitre.org."""
         cwe_dict = {}
-        cwe_objects = find_cwe_objects(mitre_data)
         
+        # Собираем уникальные CWE ID из JSON
+        cwe_ids = set()
+        cwe_objects = find_cwe_objects(mitre_data)
         for obj in cwe_objects:
             cwe_id = obj.get("cweId")
-            
-            raw_name = str(obj.get("description", ""))
-            
             if cwe_id and isinstance(cwe_id, str) and cwe_id.startswith("CWE-"):
-                # Удаляем дублирующийся идентификатор 
-                clean_name = re.sub(r'^(CWE-\d+[:\s\-]*)', '', raw_name, flags=re.IGNORECASE).strip()
+                cwe_ids.add(cwe_id)
                 
-                if not clean_name:
-                    clean_name = "Not specified"
-                    
-                # API не отдает отдельного длинного описания для CWE, используем очищенное название
-                cwe_dict[cwe_id] = {
-                    "name": clean_name,
-                    "description": clean_name 
-                }
+        # Дополнительный поиск через recursive_search
+        found_ids = recursive_search(mitre_data, ["cweId"])
+        for cwe_id in found_ids:
+            if isinstance(cwe_id, str) and cwe_id.startswith("CWE-"):
+                cwe_ids.add(cwe_id)
+                
+        # Запрашиваем детали для каждого CWE
+        for cwe_id in cwe_ids:
+            cwe_num = cwe_id.replace("CWE-", "")
+            url = f"https://cwe-api.mitre.org/api/v1/cwe/weakness/{cwe_num}"
+            
+            try:
+                async with session.get(url, timeout=TIMEOUT_SEC) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        weakness_list = data.get("Weaknesses", [])
+                        if weakness_list:
+                            weakness = weakness_list[0]
+                            
+                            # 1. Name: берем и чистим от префикса CWE-XXX:
+                            raw_name = weakness.get("Name", "Unknown")
+                            clean_name = re.sub(r'^CWE-\d+[:\s\-]*', '', raw_name, flags=re.IGNORECASE).strip()
+                            if not clean_name:
+                                clean_name = "Not specified"
+                                
+                            # 2. Description: объединяем Description и ExtendedDescription
+                            desc = weakness.get("Description", "")
+                            ext_desc = weakness.get("ExtendedDescription", "")
+                            full_desc = f"{desc} {ext_desc}".replace("\n", " ").strip()
+                            if not full_desc:
+                                full_desc = clean_name
+                                
+                            cwe_dict[cwe_id] = {
+                                "name": clean_name,
+                                "description": full_desc
+                            }
+                        else:
+                            cwe_dict[cwe_id] = {"name": "Unknown", "description": "No data found"}
+                    else:
+                        cwe_dict[cwe_id] = {"name": "Unknown", "description": f"API returned {response.status}"}
+            except Exception as e:
+                logger.error(f"Ошибка CWE API для {cwe_id}: {e}")
+                cwe_dict[cwe_id] = {"name": "Unknown", "description": "Could not fetch details"}
+                
         return cwe_dict
-    
+
     def extract_cpe_universal(self, mitre_data: dict) -> List[str]:
         """Универсальный поиск/синтез CPE."""
         cpe_list = []
@@ -129,8 +157,8 @@ class CVEProcessor:
                 if isinstance(affected, list):
                     for affected_item in affected:
                         if isinstance(affected_item, dict):
-                            vendor = affected_item.get("vendor", "")
-                            product = affected_item.get("product", "")
+                            vendor = affected_item.get("vendor", " ")
+                            product = affected_item.get("product", " ")
                             
                             if vendor and product and isinstance(vendor, str) and isinstance(product, str):
                                 if vendor.lower() != "n/a" and product.lower() != "n/a":
@@ -143,7 +171,7 @@ class CVEProcessor:
                                             if isinstance(ver_list, list):
                                                 for version in ver_list:
                                                     if isinstance(version, dict):
-                                                        ver_str = version.get("version", "")
+                                                        ver_str = version.get("version", " ")
                                                         if ver_str and isinstance(ver_str, str) and ver_str.lower() != "n/a":
                                                             cpe_str = f"cpe:2.3:a:{vendor_cpe}:{product_cpe}:{ver_str}:*:*:*:*:*:*:*"
                                                             cpe_list.append(cpe_str)
@@ -152,7 +180,7 @@ class CVEProcessor:
                                         cpe_list.append(f"cpe:2.3:a:{vendor_cpe}:{product_cpe}:*:*:*:*:*:*:*:*")
         
         return list(set(cpe_list))
-    
+
     async def process_cve(self, cve_id: str, vendor_data: dict, session: aiohttp.ClientSession) -> dict:
         api_url = f"https://cveawg.mitre.org/api/cve/{cve_id}"
         
@@ -164,7 +192,7 @@ class CVEProcessor:
                     
                     cvss_list = self.extract_cvss_universal(mitre_data)
                     cpe_list = self.extract_cpe_universal(mitre_data)
-                    cwe_dict = self.extract_cwe_data(mitre_data)
+                    cwe_dict = await self.extract_cwe_data(mitre_data, session)  # <-- Асинхронный вызов с передачей session
                     
                     desc_list = recursive_search(mitre_data, ["descriptions"])
                     description = "No description"
@@ -208,7 +236,7 @@ class CVEProcessor:
             "cpe_list": ["N/A"],
             "cwe": {"N/A": {"name": "Not specified", "description": "No CWE data available"}}
         }
-    
+
     async def process_all(self, cve_list: List[dict]) -> List[dict]:
         to_process = [item for item in cve_list if item["ID"] not in self.processed_ids]
         logger.info(f"К обработке: {len(to_process)} из {len(cve_list)} CVE")
@@ -246,27 +274,26 @@ async def main_async():
     if not Path(INPUT_FILE).exists():
         logger.error(f"Файл {INPUT_FILE} не найден!")
         return
-    
     with open(INPUT_FILE, 'r', encoding='utf-8') as f:
         collected_data = json.load(f)
-    
+
     logger.info(f"Загружено {len(collected_data)} CVE")
     processor = CVEProcessor()
     enriched_results = await processor.process_all(collected_data)
-    
+
     # === ДЕДУПЛИКАЦИЯ ПО ID ===
     unique_results = {}
     for item in enriched_results:
         cve_id = item.get("ID")
         if cve_id and cve_id not in unique_results:
             unique_results[cve_id] = item
-    
+
     final_results = list(unique_results.values())
     logger.info(f"После дедупликации: {len(final_results)} уникальных CVE (было {len(enriched_results)})")
-    
+
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
         json.dump(final_results, f, ensure_ascii=False, indent=2)
-    
+
     logger.info(f"Готово! Результат в {OUTPUT_FILE}")
 
 def main():

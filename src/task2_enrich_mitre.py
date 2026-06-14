@@ -2,16 +2,13 @@ import asyncio
 import aiohttp
 import json
 import os
-import pickle
 import logging
+import re
 from pathlib import Path
-from bs4 import BeautifulSoup
 from typing import Dict, List, Any
-from dataclasses import dataclass
 
 INPUT_FILE = "data/result_task_1.json"
 OUTPUT_FILE = "data/result_task_2.json"
-CACHE_FILE = "data/cwe_cache.pkl"
 PROGRESS_FILE = "data/progress_task_2.json"
 TIMEOUT_SEC = 15
 MAX_CONCURRENT = 15
@@ -19,58 +16,6 @@ BATCH_SIZE = 50
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-@dataclass
-class CWEInfo:
-    id: str
-    name: str
-    description: str
-
-class CWEProcessor:
-    def __init__(self):
-        self.cache = self._load_cache()
-        self.semaphore = asyncio.Semaphore(10)
-        
-    def _load_cache(self) -> Dict[str, CWEInfo]:
-        if Path(CACHE_FILE).exists():
-            try:
-                with open(CACHE_FILE, 'rb') as f:
-                    return pickle.load(f)
-            except Exception:
-                pass
-        return {}
-    
-    def _save_cache(self):
-        Path(CACHE_FILE).parent.mkdir(parents=True, exist_ok=True)
-        with open(CACHE_FILE, 'wb') as f:
-            pickle.dump(self.cache, f)
-    
-    async def fetch_cwe_details(self, cwe_id: str, session: aiohttp.ClientSession) -> CWEInfo:
-        if cwe_id in self.cache:
-            return self.cache[cwe_id]
-        
-        async with self.semaphore:
-            cwe_num = cwe_id.replace("CWE-", "")
-            url = f"https://cwe.mitre.org/data/definitions/{cwe_num}.html"
-            try:
-                async with session.get(url, timeout=TIMEOUT_SEC) as response:
-                    if response.status == 200:
-                        html = await response.text()
-                        soup = BeautifulSoup(html, 'html.parser')
-                        name_tag = soup.find('h2')
-                        name = name_tag.get_text(strip=True).replace("Click for details", "").strip() if name_tag else "Unknown"
-                        
-                        desc_div = soup.find('div', id='Description')
-                        desc = "No description"
-                        if desc_div and desc_div.find_next_sibling('div'):
-                            desc = desc_div.find_next_sibling('div').get_text(separator=' ', strip=True)
-                        
-                        info = CWEInfo(id=cwe_id, name=name, description=desc[:500] + "..." if len(desc) > 500 else desc)
-                        self.cache[cwe_id] = info
-                        return info
-            except Exception as e:
-                logger.error(f"Ошибка CWE {cwe_id}: {e}")
-        return CWEInfo(id=cwe_id, name="Unknown", description="Could not fetch details")
 
 def recursive_search(data: Any, target_keys: List[str], results: List[Any] = None) -> List[Any]:
     """Рекурсивно ищет все значения по ключам в любом месте JSON."""
@@ -88,9 +33,24 @@ def recursive_search(data: Any, target_keys: List[str], results: List[Any] = Non
     
     return results
 
+def find_cwe_objects(data: Any, results: List[dict] = None) -> List[dict]:
+    """Рекурсивно ищет объекты-словари, содержащие ключ cweId."""
+    if results is None:
+        results = []
+    
+    if isinstance(data, dict):
+        if "cweId" in data:
+            results.append(data)
+        for value in data.values():
+            find_cwe_objects(value, results)
+    elif isinstance(data, list):
+        for item in data:
+            find_cwe_objects(item, results)
+    
+    return results
+
 class CVEProcessor:
     def __init__(self):
-        self.cwe_processor = CWEProcessor()
         self.processed_ids = self._load_progress()
         
     def _load_progress(self) -> set:
@@ -126,17 +86,29 @@ class CVEProcessor:
         
         return cvss_list
     
-    def extract_cwe_universal(self, mitre_data: dict) -> List[str]:
-        """Универсальный поиск CWE в любом месте JSON."""
-        cwe_ids = []
+    def extract_cwe_data(self, mitre_data: dict) -> dict:
+        """Извлекает данные CWE непосредственно из JSON API Mitre."""
+        cwe_dict = {}
+        cwe_objects = find_cwe_objects(mitre_data)
         
-        cwe_data_list = recursive_search(mitre_data, ["cweId"])
-        
-        for cwe_val in cwe_data_list:
-            if isinstance(cwe_val, str) and cwe_val.startswith("CWE-"):
-                cwe_ids.append(cwe_val)
-        
-        return list(set(cwe_ids))
+        for obj in cwe_objects:
+            cwe_id = obj.get("cweId")
+            # В структуре CVE 5.0 название CWE часто лежит в поле description вместе с ID
+            raw_name = str(obj.get("description", ""))
+            
+            if cwe_id and isinstance(cwe_id, str) and cwe_id.startswith("CWE-"):
+                # Удаляем дублирующийся идентификатор из названия (например, "CWE-400 Uncontrolled..." -> "Uncontrolled...")
+                clean_name = re.sub(r'^(CWE-\d+[:\s\-]*)', '', raw_name, flags=re.IGNORECASE).strip()
+                
+                if not clean_name:
+                    clean_name = "Not specified"
+                    
+                # API не отдает отдельного длинного описания для CWE, используем очищенное название
+                cwe_dict[cwe_id] = {
+                    "name": clean_name,
+                    "description": clean_name 
+                }
+        return cwe_dict
     
     def extract_cpe_universal(self, mitre_data: dict) -> List[str]:
         """Универсальный поиск/синтез CPE."""
@@ -191,13 +163,8 @@ class CVEProcessor:
                     meta = mitre_data.get("cveMetadata", {})
                     
                     cvss_list = self.extract_cvss_universal(mitre_data)
-                    cwe_ids = self.extract_cwe_universal(mitre_data)
                     cpe_list = self.extract_cpe_universal(mitre_data)
-                    
-                    cwe_dict = {}
-                    for cwe_id_val in cwe_ids:
-                        cwe_info = await self.cwe_processor.fetch_cwe_details(cwe_id_val, session)
-                        cwe_dict[cwe_id_val] = {"name": cwe_info.name, "description": cwe_info.description}
+                    cwe_dict = self.extract_cwe_data(mitre_data)
                     
                     desc_list = recursive_search(mitre_data, ["descriptions"])
                     description = "No description"
@@ -220,7 +187,7 @@ class CVEProcessor:
                         "description": str(description),
                         "cvss_list": cvss_list if cvss_list else [{"version": "N/A", "score": None, "vector": "N/A", "severity": "N/A"}],
                         "cpe_list": cpe_list if cpe_list else ["N/A"],
-                        "cwe": cwe_dict if cwe_dict else {"N/A": {"name": "Not specified", "description": "No CWE data available in MITRE"}}
+                        "cwe": cwe_dict if cwe_dict else {"N/A": {"name": "Not specified", "description": "No CWE data available in MITRE API"}}
                     }
                 else:
                     return self._get_fallback(cve_id, vendor_data)
@@ -267,7 +234,6 @@ class CVEProcessor:
                         self.processed_ids.add(result["ID"])
                 
                 self._save_progress()
-                self.cwe_processor._save_cache()
                 
                 if (i + BATCH_SIZE) % 500 == 0 or (i + BATCH_SIZE) >= len(to_process):
                     logger.info(f"Обработано: {len(self.processed_ids)}/{len(cve_list)}")
@@ -288,7 +254,7 @@ async def main_async():
     processor = CVEProcessor()
     enriched_results = await processor.process_all(collected_data)
     
-    # === ЖЕСТКАЯ ДЕДУПЛИКАЦИЯ ПО ID ===
+    # === ДЕДУПЛИКАЦИЯ ПО ID ===
     unique_results = {}
     for item in enriched_results:
         cve_id = item.get("ID")
@@ -301,7 +267,7 @@ async def main_async():
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
         json.dump(final_results, f, ensure_ascii=False, indent=2)
     
-    logger.info(f"✅ Готово! Результат в {OUTPUT_FILE}")
+    logger.info(f"Готово! Результат в {OUTPUT_FILE}")
 
 def main():
     try:

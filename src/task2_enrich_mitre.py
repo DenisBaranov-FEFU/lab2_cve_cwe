@@ -93,11 +93,11 @@ class CVEProcessor:
         
         for obj in cwe_objects:
             cwe_id = obj.get("cweId")
-            # В структуре CVE 5.0 название CWE часто лежит в поле description вместе с ID
+            
             raw_name = str(obj.get("description", ""))
             
             if cwe_id and isinstance(cwe_id, str) and cwe_id.startswith("CWE-"):
-                # Удаляем дублирующийся идентификатор из названия (например, "CWE-400 Uncontrolled..." -> "Uncontrolled...")
+                # Удаляем дублирующийся идентификатор 
                 clean_name = re.sub(r'^(CWE-\d+[:\s\-]*)', '', raw_name, flags=re.IGNORECASE).strip()
                 
                 if not clean_name:
